@@ -38,6 +38,7 @@ func getConnection(host string, port int, password string, tlsEnabled bool) Redi
 	options := &redis.Options{
 		Addr:     address,
 		Password: password,
+                DialTimeout: 2 * time.Second, 
 	}
 
 	if tlsEnabled {
@@ -48,6 +49,7 @@ func getConnection(host string, port int, password string, tlsEnabled bool) Redi
 	clusterOptions := &redis.ClusterOptions{
 		Addrs:     []string{address},
 		Password:  password,
+                DialTimeout: 2 * time.Second, 
 		TLSConfig: options.TLSConfig,
 	}
 
@@ -151,6 +153,7 @@ func main() {
 	// Check if host was provided
 	if c.Host == "" {
 		fmt.Println("Error: -h (Redis host) is required.")
+                f.PrintDefaults()
 		os.Exit(1)
 	}
 	redisClient := getConnection(c.Host, c.Port, c.Password, c.TLSEnabled)
