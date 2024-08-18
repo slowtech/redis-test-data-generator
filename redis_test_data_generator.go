@@ -137,7 +137,7 @@ func generateDataWithPipeline(ctx context.Context, redisClient RedisClient, star
 func main() {
 	var c Config
 	f := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	f.StringVar(&c.Host, "h", "127.0.0.1", "Redis host")
+	f.StringVar(&c.Host, "h", "", "Redis host (required)")
 	f.IntVar(&c.Port, "P", 6379, "Redis port")
 	f.StringVar(&c.Password, "a", "", "Redis password")
 	f.IntVar(&c.TotalKeys, "n", 10000, "Total number of keys to generate")
@@ -147,6 +147,12 @@ func main() {
 	f.BoolVar(&c.TLSEnabled, "tls", false, "Enable TLS for Redis connection")
 
 	f.Parse(os.Args[1:])
+
+	// Check if host was provided
+	if c.Host == "" {
+		fmt.Println("Error: -h (Redis host) is required.")
+		os.Exit(1)
+	}
 	redisClient := getConnection(c.Host, c.Port, c.Password, c.TLSEnabled)
 	defer redisClient.Close()
 
