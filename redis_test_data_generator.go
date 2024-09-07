@@ -5,25 +5,30 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"github.com/redis/go-redis/v9"
 	"math/rand"
 	"os"
+	"strconv"
+	"strings"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // Global variable to keep track of the number of expired keys to be set
 var expiredKeyCount int
+var expireEnabled bool
+var memoryLimitEnabled bool
 
 type Config struct {
-	Host        string
-	Port        int
-	Password    string
-	TotalKeys   int
-	ExpiryRatio float64
-	ExpiryStart int
-	ExpiryEnd   int
-	TLSEnabled  bool
+	Host          string
+	Port          int
+	Password      string
+	TotalKeys     int
+	ExpiryRatio   float64
+	ExpiryStart   int
+	ExpiryEnd     int
+	TLSEnabled    bool
+	ExpireEnabled bool
+	MaxMemoryMB   string
 }
 
 // Define an interface for Redis client
@@ -36,9 +41,9 @@ type RedisClient interface {
 func getConnection(host string, port int, password string, tlsEnabled bool) RedisClient {
 	address := fmt.Sprintf("%s:%d", host, port)
 	options := &redis.Options{
-		Addr:     address,
-		Password: password,
-                DialTimeout: 2 * time.Second, 
+		Addr:        address,
+		Password:    password,
+		DialTimeout: 2 * time.Second,
 	}
 
 	if tlsEnabled {
@@ -47,10 +52,10 @@ func getConnection(host string, port int, password string, tlsEnabled bool) Redi
 
 	// Try connecting as a cluster client first
 	clusterOptions := &redis.ClusterOptions{
-		Addrs:     []string{address},
-		Password:  password,
-                DialTimeout: 2 * time.Second, 
-		TLSConfig: options.TLSConfig,
+		Addrs:       []string{address},
+		Password:    password,
+		DialTimeout: 2 * time.Second,
+		TLSConfig:   options.TLSConfig,
 	}
 
 	clusterClient := redis.NewClusterClient(clusterOptions)
@@ -75,14 +80,42 @@ func testClusterConnection(client *redis.ClusterClient) error {
 }
 
 func setKeyExpiry(ctx context.Context, pipe redis.Pipeliner, key string, i, threshold, expiryStart, expiryEnd int) {
-	if expiredKeyCount > 0 {
+	if (memoryLimitEnabled || expiredKeyCount > 0) && expireEnabled {
 
 		if i%10 < threshold {
 			expireTime := time.Duration(rand.Intn(expiryEnd-expiryStart+1)+expiryStart) * time.Second
 			pipe.Expire(ctx, key, expireTime)
-			expiredKeyCount--
+			if !memoryLimitEnabled {
+				expiredKeyCount--
+			}
 		}
 	}
+}
+
+func getUsedMemory(ctx context.Context, redisClient RedisClient) (int, error) {
+	var usedMemoryStr string
+	var memoryStr string
+	if client, ok := redisClient.(*redis.Client); ok {
+		memoryInfo := client.Info(ctx, "memory")
+		memoryStr = memoryInfo.Val()
+	} else if client, ok := redisClient.(*redis.ClusterClient); ok {
+		memoryInfo := client.Info(ctx, "memory")
+		memoryStr = memoryInfo.Val()
+	}
+	for _, line := range strings.Split(memoryStr, "\n") {
+		if strings.HasPrefix(line, "used_memory:") {
+			fields := strings.Split(line, ":")
+			if len(fields) > 1 {
+				usedMemoryStr = strings.TrimSpace(fields[1])
+				break
+			}
+		}
+	}
+	usedMemory, err := strconv.Atoi(usedMemoryStr)
+	if err != nil {
+		return 0, fmt.Errorf("failed to convert used_memory to int: %w", err)
+	}
+	return usedMemory, nil
 }
 
 func generateDataWithPipeline(ctx context.Context, redisClient RedisClient, startIndex, batchSize int, timestamp string, expiryRatio float64, expiryStart, expiryEnd int) int {
@@ -147,14 +180,26 @@ func main() {
 	f.IntVar(&c.ExpiryStart, "s", 60, "Start of expiration time in seconds")
 	f.IntVar(&c.ExpiryEnd, "e", 3600, "End of expiration time in seconds")
 	f.BoolVar(&c.TLSEnabled, "tls", false, "Enable TLS for Redis connection")
+	f.BoolVar(&c.ExpireEnabled, "expire", true, "Enable expiration time for Redis keys")
+	f.StringVar(&c.MaxMemoryMB, "max_memory", "", "Specify the size of test data to generate (in MB)")
 
 	f.Parse(os.Args[1:])
 
 	// Check if host was provided
 	if c.Host == "" {
 		fmt.Println("Error: -h (Redis host) is required.")
-                f.PrintDefaults()
+		f.PrintDefaults()
 		os.Exit(1)
+	}
+	var maxMemoryBytes int
+	if c.MaxMemoryMB != "" {
+		maxMemoryMB, err := strconv.Atoi(c.MaxMemoryMB)
+		if err != nil {
+			fmt.Printf("Invalid value for max_memory: %v\n", err)
+			return
+		}
+		maxMemoryBytes = maxMemoryMB * 1024 * 1024 // Convert MB to bytes
+		memoryLimitEnabled = true
 	}
 	redisClient := getConnection(c.Host, c.Port, c.Password, c.TLSEnabled)
 	defer redisClient.Close()
@@ -167,10 +212,28 @@ func main() {
 	}
 	timestamp := time.Now().Format("20060102150405")
 	expiredKeyCount = int(float64(c.TotalKeys) * c.ExpiryRatio)
-
+	expireEnabled = c.ExpireEnabled
 	batchSize := 10000
 	startIndex := 1
 	generatedKeys := 0
+
+        fmt.Println(c.MaxMemoryMB)
+	if c.MaxMemoryMB != "" {
+		for {
+			usedMemory, _ := getUsedMemory(ctx, redisClient)
+
+			if usedMemory >= maxMemoryBytes {
+				fmt.Printf("\nUsed memory (%d bytes) exceeds max memory limit (%d bytes). Exiting...\n", usedMemory, maxMemoryBytes)
+				return
+			}
+			startIndex = generateDataWithPipeline(ctx, redisClient, startIndex, batchSize, timestamp, c.ExpiryRatio, c.ExpiryStart, c.ExpiryEnd)
+                        generatedKeys += batchSize
+                            remainingMemoryBytes := maxMemoryBytes - usedMemory
+remainingMemoryMB := float64(remainingMemoryBytes) / 1048576 
+
+			fmt.Printf("\rGenerate: %d keys, Memory needed to fill: %.2f MB", generatedKeys, remainingMemoryMB)
+		}
+	}
 
 	for generatedKeys < c.TotalKeys {
 		if c.TotalKeys-generatedKeys < batchSize {
@@ -178,6 +241,8 @@ func main() {
 		}
 		startIndex = generateDataWithPipeline(ctx, redisClient, startIndex, batchSize, timestamp, c.ExpiryRatio, c.ExpiryStart, c.ExpiryEnd)
 		generatedKeys += batchSize
-		fmt.Printf("Generated %d keys.\n", generatedKeys)
+		progress := float64(generatedKeys) / float64(c.TotalKeys) * 100
+		fmt.Printf("\rProgress: %.2f%% (%d/%d keys)", progress, generatedKeys, c.TotalKeys)
 	}
+	fmt.Println()
 }
